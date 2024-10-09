@@ -56,24 +56,23 @@ func call(rpc_name string, args interface{}, reply interface{}) bool {
 
 // ========== RPC Calls ==========
 
-func RequestJob() Job {
-
+func RequestJob() *Job {
 	workerID := os.Getpid()
 
-	reply := Job{}
+	reply := &Job{}
 
-	call("Coordinator.RequestJob", &workerID, &reply)
+	call("Coordinator.RequestJob", &workerID, reply)
 
 	return reply
 }
 
-func SendJobResults(j Job) {
-	call("Coordinator.SendJobResults", &j, nil)
+// Send job results to the coordinator
+func SendJobResults(job *Job) {
+	call("Coordinator.SendJobResults", job, nil)
 }
 
 // main/mr_worker.go calls this function
 func Worker(mapFun func(string, string) []KeyValue, reduceFun func(string, []string) string) {
-
 	quit := false
 	for !quit {
 
@@ -104,22 +103,22 @@ func Worker(mapFun func(string, string) []KeyValue, reduceFun func(string, []str
 
 // ========== Methods ==========
 
-func handleMapJob(j Job, mapFun func(filename string, content string) []KeyValue) {
-
+func handleMapJob(j *Job, mapFun func(filename string, content string) []KeyValue) {
 	content, err := os.ReadFile(j.InputFile)
 	if err != nil {
 		log.Fatalf("worker - cannot read %v - %v \n", j.InputFile, err)
+		return
 	}
 
 	keyVals := mapFun(j.InputFile, string(content))
 
 	sort.Sort(ArrKeyValue(keyVals))
 
-	partions := make([][]KeyValue, j.NReducer)
+	partitions := make([][]KeyValue, j.NReducer)
 
 	for _, v := range keyVals {
 		pKey := ihash(v.Key) & j.NReducer
-		partions[pKey] = append(partions[pKey], v)
+		partitions[pKey] = append(partitions[pKey], v)
 	}
 
 	intermediateFiles := make([]string, j.NReducer)
@@ -129,9 +128,10 @@ func handleMapJob(j Job, mapFun func(filename string, content string) []KeyValue
 
 		f, _ := os.Create(intermediateFile)
 
-		b, err := json.Marshal(partions[i])
+		b, err := json.Marshal(partitions[i])
 		if err != nil {
-			log.Printf("worker - Marshal error: %v \n", err)
+			log.Fatalf("worker - Marshal error: %v \n", err)
+			return
 		}
 
 		f.Write(b)
@@ -146,6 +146,54 @@ func handleMapJob(j Job, mapFun func(filename string, content string) []KeyValue
 	SendJobResults(j)
 }
 
-func handleReduceJob(j Job, f func(string, []string) string) {
+func handleReduceJob(j *Job, f func(string, []string) string) {
+	files := j.IntermediateFiles
 
+	intermediate := []KeyValue{}
+
+	for _, file := range files {
+		content, err := os.ReadFile(file)
+		if err != nil {
+			log.Fatalf("worker - cannot read %v - %v \n", j.InputFile, err)
+			return
+		}
+
+		var in []KeyValue
+		err = json.Unmarshal(content, &in)
+		if err != nil {
+			log.Fatalf("worker - Unmarshal error: %v \n", err.Error())
+		}
+
+		intermediate = append(intermediate, in...)
+	}
+
+	sort.Sort(ArrKeyValue(intermediate))
+
+	out_name := fmt.Sprintf("mr-out-%v", j.ID)
+	tmpFile, err := os.CreateTemp(".", out_name)
+	if err != nil {
+		log.Fatalf("worker - error creating temp file: %v", err.Error())
+	}
+
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		output := f(intermediate[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(tmpFile, "%v %v\n", intermediate[i].Key, output)
+
+		i = j
+	}
+
+	os.Rename(tmpFile.Name(), out_name)
+
+	SendJobResults(j)
 }
