@@ -4,12 +4,31 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
-	"log"
 	"net/rpc"
 	"os"
 	"sort"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 )
+
+func init() {
+	dirPath := "./data"
+
+	// Check if the directory already exists
+	if _, err := os.Stat(dirPath); os.IsNotExist(err) {
+		// Directory does not exist, create it
+		err := os.MkdirAll(dirPath, os.ModePerm)
+		if err != nil {
+			fmt.Printf("Error creating directory: %v\n", err)
+			return
+		}
+		fmt.Println("Directory created:", dirPath)
+	} else {
+		// Directory already exists
+		fmt.Println("Directory already exists:", dirPath)
+	}
+}
 
 type KeyValue struct {
 	Key   string
@@ -40,7 +59,8 @@ func call(rpc_name string, args interface{}, reply interface{}) bool {
 	sockname := coordinatorSock()
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
-		log.Fatal("mr_worker - error dialing: ", err)
+		log.Println("Worker - error dialing: ", err)
+		return false
 	}
 	defer c.Close()
 
@@ -54,43 +74,56 @@ func call(rpc_name string, args interface{}, reply interface{}) bool {
 	return false
 }
 
+const (
+	RequestJobCall     string = "Coordinator.RequestJob"
+	SendJobResultsCall string = "Coordinator.SendJobResults"
+)
+
 // ========== RPC Calls ==========
 
-func RequestJob() *Job {
-	workerID := os.Getpid()
-
+func RequestJob(PID int) *Job {
 	reply := &Job{}
 
-	call("Coordinator.RequestJob", &workerID, reply)
+	if !call(RequestJobCall, &PID, reply) {
+		// No Response OR Error Dialing the Coordinator will
+		// make the Worker quit
+		reply.Action = Quit
+		return reply
+	}
 
 	return reply
 }
 
 // Send job results to the coordinator
 func SendJobResults(job *Job) {
-	call("Coordinator.SendJobResults", job, nil)
+	call(SendJobResultsCall, job, &struct{}{})
 }
 
 // main/mr_worker.go calls this function
 func Worker(mapFun func(string, string) []KeyValue, reduceFun func(string, []string) string) {
+	workerID := os.Getpid()
 	quit := false
-	for !quit {
 
-		job := RequestJob()
+	for !quit {
+		// Request a Job From the Coordinator
+		log.Infof("Requesting job for Worker %d\n", workerID)
+		job := RequestJob(workerID)
 
 		switch job.Action {
 		case Wait:
+			// Sleep for 10 second before asking again for a Job
+			log.Infof("Worker %d waiting \n", workerID)
 			time.Sleep(10 * time.Second)
-			continue
 		case Quit:
 			quit = true
-			continue
-		case Action:
-			// Process job
+		case Work:
+			// Process a MapJob
+			log.Infof("Worker %d received a job \n", workerID)
 			if job.Type == MapJob {
 				handleMapJob(job, mapFun)
 			}
 
+			// Process a Reduce Job
 			if job.Type == ReduceJob {
 				handleReduceJob(job, reduceFun)
 			}
@@ -103,65 +136,70 @@ func Worker(mapFun func(string, string) []KeyValue, reduceFun func(string, []str
 
 // ========== Methods ==========
 
-func handleMapJob(j *Job, mapFun func(filename string, content string) []KeyValue) {
-	content, err := os.ReadFile(j.InputFile)
+func handleMapJob(job *Job, mapFun func(filename string, content string) []KeyValue) {
+	content, err := os.ReadFile(job.InputFile)
 	if err != nil {
-		log.Fatalf("worker - cannot read %v - %v \n", j.InputFile, err)
-		return
+		panic(err)
 	}
 
-	keyVals := mapFun(j.InputFile, string(content))
+	keyVals := mapFun(job.InputFile, string(content))
 
 	sort.Sort(ArrKeyValue(keyVals))
 
-	partitions := make([][]KeyValue, j.NReducer)
+	partitions := make([][]KeyValue, job.NReducer)
 
 	for _, v := range keyVals {
-		pKey := ihash(v.Key) & j.NReducer
+		pKey := ihash(v.Key) % job.NReducer
+
 		partitions[pKey] = append(partitions[pKey], v)
 	}
 
-	intermediateFiles := make([]string, j.NReducer)
-	for i := range j.NReducer {
-		intermediateFile := fmt.Sprintf("mr-%v-%v", j.ID, i)
+	intermediateFiles := make([]string, job.NReducer)
+	for i := range job.NReducer {
+		intermediateFile := fmt.Sprintf("mr-%d-%d", job.ID, i)
 		intermediateFiles[i] = intermediateFile
 
-		f, _ := os.Create(intermediateFile)
+		log.Debug(intermediateFile)
+		f, err := os.CreateTemp("./data/", intermediateFile)
+		if err != nil {
+			panic(err)
+		}
 
 		b, err := json.Marshal(partitions[i])
 		if err != nil {
-			log.Fatalf("worker - Marshal error: %v \n", err)
-			return
+			panic(err)
 		}
 
 		f.Write(b)
+
+		os.Rename(f.Name(), "./data/"+intermediateFile)
 
 		f.Close()
 	}
 
 	// Add intermediate files to job state
-	j.IntermediateFiles = intermediateFiles
+	job.IntermediateFiles = intermediateFiles
 
 	// Report back to the coordinator with intermediate files
-	SendJobResults(j)
+	log.Infof("Worker %d sending map job results\n", job.WorkerID)
+	SendJobResults(job)
 }
 
-func handleReduceJob(j *Job, f func(string, []string) string) {
-	files := j.IntermediateFiles
+func handleReduceJob(job *Job, f func(string, []string) string) {
+	files := job.IntermediateFiles
 
 	intermediate := []KeyValue{}
 
 	for _, file := range files {
-		content, err := os.ReadFile(file)
+		content, err := os.ReadFile("./data/" + file)
 		if err != nil {
-			log.Fatalf("worker - cannot read %v - %v \n", j.InputFile, err)
-			return
+			panic(err)
 		}
 
 		var in []KeyValue
 		err = json.Unmarshal(content, &in)
 		if err != nil {
-			log.Fatalf("worker - Unmarshal error: %v \n", err.Error())
+			panic(err)
 		}
 
 		intermediate = append(intermediate, in...)
@@ -169,10 +207,10 @@ func handleReduceJob(j *Job, f func(string, []string) string) {
 
 	sort.Sort(ArrKeyValue(intermediate))
 
-	out_name := fmt.Sprintf("mr-out-%v", j.ID)
-	tmpFile, err := os.CreateTemp(".", out_name)
+	out_name := fmt.Sprintf("mr-out-%d", job.ReducerBucket)
+	tmpFile, err := os.CreateTemp("./data", out_name)
 	if err != nil {
-		log.Fatalf("worker - error creating temp file: %v", err.Error())
+		panic(err)
 	}
 
 	i := 0
@@ -193,7 +231,8 @@ func handleReduceJob(j *Job, f func(string, []string) string) {
 		i = j
 	}
 
-	os.Rename(tmpFile.Name(), out_name)
+	os.Rename(tmpFile.Name(), "./data/"+out_name)
 
-	SendJobResults(j)
+	log.Infof("Worker %d sending reduce job results\n", job.WorkerID)
+	SendJobResults(job)
 }

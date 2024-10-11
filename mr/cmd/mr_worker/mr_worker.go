@@ -1,12 +1,17 @@
 package main
 
+// To start a worker
+//
+// go run mr_worker.go *.so
+//
+
 import (
 	"fmt"
-	"log"
 	"os"
 	"plugin"
 
 	"github.com/guisaez/go-distributed-programming/mr"
+	log "github.com/sirupsen/logrus"
 )
 
 func main() {
@@ -15,8 +20,10 @@ func main() {
 		os.Exit(1)
 	}
 
+	log.Info("Loading plugin...")
 	mapFun, reduceFun := loadPlugin(os.Args[1])
 
+	log.Info("Initializing worker process")
 	mr.Worker(mapFun, reduceFun)
 }
 

@@ -1,12 +1,17 @@
 package main
 
+//
+// To start the coordinator process
+//
+// go run mr_coordinator.go pg*.txt
+//
 import (
 	"fmt"
-	"log"
 	"os"
 	"time"
 
 	"github.com/guisaez/go-distributed-programming/mr"
+	log "github.com/sirupsen/logrus"
 )
 
 func main() {
@@ -20,6 +25,5 @@ func main() {
 		time.Sleep(time.Second)
 	}
 
-	log.Println("Coordinator exited!")
-
+	log.Info("Coordinator exited!")
 }
