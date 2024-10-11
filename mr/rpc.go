@@ -6,18 +6,20 @@ import (
 )
 
 // ========== RPC Definitions ===========
-const MapJob, ReduceJob int = 0, 1
-const Pending, Running, Completed int = 0, 1, 2
-const Wait, Quit, Action int = 0, 1, 2
+const (
+	MapJob, ReduceJob           int = 0, 1
+	PENDING, RUNNING, COMPLETED int = 0, 1, 2
+	Wait, Quit, Work            int = 0, 1, 2
+)
 
 type Job struct {
 	ID                int
+	WorkerID          int
 	Type              int
 	NReducer          int
-	WorkerId          int64
-	StartTime         int64
 	InputFile         string
 	IntermediateFiles []string
+	ReducerBucket     int
 	Action            int
 }
 
